@@ -1,0 +1,7 @@
+-   id: synapse
+    name: synapse-to-ipynb
+    description: 'nbstripout: strip output from Jupyter and IPython notebooks'
+    entry: nbstripout
+    pass_filenames: false
+    language: python
+    types: [jupyter]

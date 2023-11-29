@@ -84,7 +84,8 @@ class NotebookDirectoryManager:
         # Read the ipynb src that we will use to update the synapse notebook with
         with open(ipynb_path) as nb:
             ipynb_cells = json.load(nb)["cells"]
-
+        for cell in ipynb_cells:
+            clean_cell(cell, to_ipynb=False)
         # Create a temporary notebook file
         fd, tmp_notebook_path = tempfile.mkstemp(dir=synnb_path.parent)
         # Close the descriptor. We'll manage this file ourselves.
@@ -135,6 +136,7 @@ class NotebookDirectoryManager:
         cells: list[dict[str, Any]] = ipynb_data["cells"]
         for cell in cells:
             cell.setdefault("metadata", {})
+            clean_cell(cell, to_ipynb=True)
 
         # Create the new .ipynb file in the target directory.
         ipynb_filename = f"{synapse_nb_path.stem}.ipynb"
@@ -226,6 +228,23 @@ def create_synapse_only_nbs(manager: NotebookDirectoryManager) -> int:
             logger.info(f"Created '{ipynb_path.name}' from '{synapse_nb.name}'")
     return ret
 
+
+def clean_cell(cell: dict, to_ipynb: bool = True) -> None:
+    if cell["cell_type"] == "code":
+        cell["outputs"] = []
+        cell["execution_count"] = 0
+        if len(cell["source"]) < 5:
+            for idx, line in enumerate(cell["source"]):
+                if not line.strip():
+                    continue
+                elif line.startswith("%run"):
+                    if to_ipynb:
+                        cell["source"][idx] = line.strip() + ".ipynb\n"
+                    else:
+                        cell["source"][idx] = line.strip().removesuffix(".ipynb") + "\n"
+                    break
+                else:
+                    break
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
