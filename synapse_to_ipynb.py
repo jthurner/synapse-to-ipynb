@@ -36,15 +36,35 @@ class NotebookDirectoryManager:
         self.synapse_dir = synapse_dir.resolve(strict=True)
         self.ipynb_dir = ipynb_dir.resolve(strict=True)
 
+        # Synapse does not have an actual folder structure,
+        # it is stored in the json metadata so we just use *.json here.
+        # Sorted by file name so it can be used with zip
         self.synapse_nbs = sorted(self.synapse_dir.glob("*.json"), key=lambda f: f.stem)
         self.ipynbs = sorted(self.ipynb_dir.glob("**/*.ipynb"), key=lambda f: f.stem)
 
-        def _diff_files(left_files: list[Path], right_files: list[Path]) -> list[Path]:
-            right_stems = [f.stem for f in right_files]
-            return [path for path in left_files if path.stem not in right_stems]
+        _synapse_nb_stems = [f.stem for f in self.synapse_nbs]
+        _ipynb_stems = [f.stem for f in self.ipynbs]
+        # Synapse does not allow duplicate file names
+        _dup_synapse_stems = {
+            f for f in _synapse_nb_stems if _synapse_nb_stems.count(f) > 1
+        }
+        _dup_ipynb_stems = {f for f in _ipynb_stems if _ipynb_stems.count(f) > 1}
+        if _dup_ipynb_stems or _dup_synapse_stems:
+            raise ValueError(
+                "Duplicate File Name(s) found:\n"
+                f"Synapse Directory: {_dup_synapse_stems}\n"
+                f"IPYNB Notebook Directory: {_dup_ipynb_stems}\n"
+            )
 
-        self.synapse_only_nbs = _diff_files(self.synapse_nbs, self.ipynbs)
-        self.ipynb_only_nbs = _diff_files(self.ipynbs, self.synapse_nbs)
+        self.synapse_nb_stems = set(_synapse_nb_stems)
+        self.ipynb_stems = set(_ipynb_stems)
+
+        self.synapse_only_nbs = [
+            nb for nb in self.synapse_nbs if nb.stem not in self.ipynb_stems
+        ]
+        self.ipynb_only_nbs = [
+            ipynb for ipynb in self.ipynbs if ipynb.stem not in self.synapse_nb_stems
+        ]
 
     @staticmethod
     def update_synapse_notebook_from_ipynb(synnb_path: Path, ipynb_path: Path) -> None:
@@ -62,24 +82,26 @@ class NotebookDirectoryManager:
         """
 
         # Read the ipynb src that we will use to update the synapse notebook with
-        with open(ipynb_path) as nb:
+        with open(ipynb_path, encoding="utf-8") as nb:
             ipynb_cells = json.load(nb)["cells"]
         for cell in ipynb_cells:
             clean_cell(cell, to_ipynb=False)
         # Create a temporary notebook file
         fd, tmp_notebook_path = tempfile.mkstemp(dir=synnb_path.parent)
+        # Close the descriptor. We'll manage this file ourselves.
+        os.close(fd)
         try:
             # Copy the contents of the actual notebook file to the temporary one
             shutil.copyfile(synnb_path, tmp_notebook_path)
 
             # Update the temporary synpase notebook file's 'cells'
             # property with the ipynb src we read earlier
-            with open(fd, "r+") as f:
+            with open(tmp_notebook_path, "r+", encoding="utf-8") as f:
                 synnb_json = json.load(f)
                 synnb_json["properties"]["cells"] = ipynb_cells
                 f.seek(0)
                 f.truncate()
-                json.dump(synnb_json, f, indent=4)
+                json.dump(synnb_json, f, ensure_ascii=False, indent=4)
 
             # Finally, replace the synpase notebook with the updated temporary one
             os.replace(tmp_notebook_path, synnb_path)
@@ -96,7 +118,7 @@ class NotebookDirectoryManager:
         """
 
         # Read in the synapse notebook.
-        with open(synapse_nb_path) as nb:
+        with open(synapse_nb_path, encoding="utf-8") as nb:
             # We're only interested in the 'properties' key.
             synapse_notebook: dict[str, Any] = json.load(nb)["properties"]
 
@@ -127,26 +149,50 @@ class NotebookDirectoryManager:
         ipynb_dir = (self.ipynb_dir / sub_dir) if sub_dir else self.ipynb_dir
         ipynb_dir.mkdir(exist_ok=True, parents=True)
         ipynb_path = ipynb_dir / ipynb_filename
-        with open(ipynb_path, "w") as ipynb:
-            json.dump(ipynb_data, ipynb, indent=4)
+        with open(ipynb_path, "w", encoding="utf-8") as ipynb:
+            json.dump(ipynb_data, ipynb, ensure_ascii=False, indent=4)
 
         return ipynb_path
 
 
 def update_synapse_nbs(manager: NotebookDirectoryManager) -> int:
-    # These should be the same, but let's check
-    synapse_nbs_stems = [f.stem for f in manager.synapse_nbs]
-    ipynbs_stems = [f.stem for f in manager.ipynbs]
-    if synapse_nbs_stems != ipynbs_stems:
-        logger.error(f"File names in {synapse_nbs_stems} don't match {ipynbs_stems}")
+    # These need to be the same, so lets check.
+    if manager.synapse_nb_stems != manager.ipynb_stems:
+        msg = (
+            "The file name's in the source directory "
+            "dont't match those in the target directory:"
+        )
+        synapse_only_stems = manager.synapse_nb_stems - manager.ipynb_stems
+        ipynb_only_stems = manager.ipynb_stems - manager.synapse_nb_stems
+        if synapse_only_stems:
+            msg += f"\nIn '{manager.synapse_dir.name}' only: {synapse_only_stems}"
+        if ipynb_only_stems:
+            msg += f"\nIn '{manager.ipynb_dir.name}' only: {ipynb_only_stems}"
+        logger.error(msg)
         return 1
 
     ret = 0
     for synnb, ipynb in zip(manager.synapse_nbs, manager.ipynbs, strict=True):
         try:
             manager.update_synapse_notebook_from_ipynb(synnb, ipynb)
-        except (KeyError, json.JSONDecodeError) as e:
-            logger.error(f"Unable to update Synapse notebook '{synnb.name}': {e}")
+        except KeyError as e:
+            msg = (
+                f"Unable to update Synapse notebook '{synnb.name}' from '{ipynb.name}'"
+            )
+            logger.error(
+                f"{msg}: {e}",
+                stack_info=True,
+            )
+            ret |= 1
+        except json.JSONDecodeError as e:
+            msg = (
+                f"An error occured updating '{synnb.name}' from '{ipynb.name}'. "
+                f"The ipynb '{ipynb.name}' could not be loaded"
+            )
+            logger.error(
+                f"{msg}: {repr(e)}",
+                stack_info=True,
+            )
             ret |= 1
         else:
             logger.info(f"Updated '{synnb.name}' from '{ipynb.name}'")
@@ -242,7 +288,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         manager = NotebookDirectoryManager(args.source, args.target)
-    except NotADirectoryError as e:
+    except (NotADirectoryError, ValueError) as e:
         logger.error(e)
         return 1
 
